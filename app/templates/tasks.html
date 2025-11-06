@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestor de Tareas</title>
+</head>
+<body>
+    <h1>Gestor de Tareas</h1>
+
+    <form action="{{ url_for('tasks.add_task_html') }}" method="POST">
+        <input type="text" name="title" placeholder="Añadir nueva tarea">
+        <button type="submit">Añadir tarea</button>
+    </form>
+
+    <h2>Lista de Tareas:</h2>
+    <ul>
+        {% for task in tasks %}
+            <li>{{ task.title }} {% if task.done %}(completada){% endif %}</li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
