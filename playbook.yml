@@ -1,0 +1,144 @@
+---
+- name: Configurar Entorno Flask y MariaDB
+  hosts: all
+  become: yes # Ejecutar tareas con privilegios de root (sudo)
+  vars:
+    project_dir: /vagrant
+    env_file: "{{ project_dir }}/.env"
+
+  tasks:
+    # --- 1. Saneamiento y Carga de Variables de Entorno (.env) ---
+    - name: Cargar variables de entorno como JSON y establecer hechos
+      ansible.builtin.shell: |
+        # 1. Leer el archivo .env, limpiar CRLF (\r) y líneas vacías/comentarios.
+        # 2. Convertir el formato KEY=VALUE al formato JSON "KEY":"VALUE".
+        CLEAN_ENV=$(
+          cat {{ env_file }} | 
+          tr -d '\r' | 
+          grep -vE '^\s*#' |
+          grep -vE '^\s*$' | 
+          awk -F'=' '{ gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print "\""$1"\":\""$2"\"" }' |
+          paste -s -d ',' -
+        )
+        
+        # 3. Imprimir el JSON completo. Ejemplo: {"KEY1":"VALUE1","KEY1":"VALUE2"}
+        echo "{ $CLEAN_ENV }"
+      register: env_output
+      changed_when: false
+      tags: [config, env]
+
+    - name: Establecer variables de entorno limpias como hechos de Ansible
+      ansible.builtin.set_fact:
+        env_vars: "{{ env_output.stdout | from_json }}"
+      tags: [config, env]
+      
+    # --- 2. Preparación del Sistema ---
+    - name: Forzar la actualización del índice de paquetes (apt update)
+      ansible.builtin.apt:
+        update_cache: yes
+      tags: [install, base]
+
+    - name: Instalar MariaDB, Python y utilidades necesarias
+      ansible.builtin.package:
+        name: 
+          - mariadb-server
+          - python3-pip 
+          - git
+          - python3-dev
+          - python3-venv
+        state: present
+      tags: [install, base]
+
+    - name: Instalar PyMySQL a nivel de sistema (Necesario para los módulos 'mysql_*' de Ansible)
+      ansible.builtin.pip:
+        name: pymysql
+        executable: pip3
+      tags: [install, db]
+
+    # --- 3. Configuración de MariaDB (Módulos declarativos de MySQL) ---
+    - name: Asegurar que el servicio MariaDB esté iniciado y habilitado
+      ansible.builtin.service:
+        name: mariadb
+        state: started
+        enabled: yes
+      tags: [db]
+
+    - name: Crear Base de Datos y Usuario
+      block:
+        - name: Crear Base de Datos
+          community.mysql.mysql_db:
+            name: "{{ env_vars.DATABASE_DB }}" 
+            state: present
+            encoding: utf8mb4
+            collation: utf8mb4_unicode_ci
+            login_unix_socket: /run/mysqld/mysqld.sock 
+          tags: [db]
+
+        - name: Crear Usuario de Aplicación y Otorgar Permisos
+          community.mysql.mysql_user:
+            name: "{{ env_vars.DATABASE_USER }}"
+            password: "{{ env_vars.DATABASE_PASSWORD }}"
+            host: "localhost"
+            priv: "{{ env_vars.DATABASE_DB }}.*:ALL" 
+            state: present
+            login_unix_socket: /run/mysqld/mysqld.sock 
+          tags: [db]
+
+    # --- 4. Configuración de la Aplicación Flask ---
+    - name: Instalar dependencias de Python a nivel de sistema
+      ansible.builtin.pip:
+        requirements: "{{ project_dir }}/requirements.txt"
+        executable: pip3 # Usamos pip3 del sistema
+        state: present
+      tags: [app, install]
+
+    - name: Aplicar migraciones de base de datos (Flask-Migrate)
+      ansible.builtin.command: python3 -m flask db upgrade # Usamos python3 -m flask
+      environment:
+        DATABASE_USER: "{{ env_vars.DATABASE_USER }}"
+        DATABASE_PASSWORD: "{{ env_vars.DATABASE_PASSWORD }}"
+        DATABASE_DB: "{{ env_vars.DATABASE_DB }}"
+        DATABASE_HOST: "{{ env_vars.DATABASE_HOST | default('localhost') }}"
+        FLASK_APP: app.app:create_app
+      args:
+        chdir: "{{ project_dir }}"
+      become: yes
+      become_user: vagrant
+      tags: [app, db]
+
+    # --- 5. Lanzar la Aplicación ---
+    
+    # Tarea 5.1: Detener procesos previos
+    - name: Detener instancias de Flask previamente en ejecución
+      ansible.builtin.shell: "pkill -f 'python3 -m flask run --host=0.0.0.0'"
+      become: yes
+      become_user: vagrant
+      failed_when: false # CRÍTICO: Ignorar el error si pkill no encuentra nada.
+      tags: [app, run]
+
+    # Tarea 5.2: Iniciar Flask en segundo plano con nohup
+    - name: Iniciar Flask en segundo plano con nohup
+      ansible.builtin.shell: |
+        nohup python3 -m flask run --host=0.0.0.0 > /tmp/flask_app.log 2>&1 &
+      environment:
+        FLASK_APP: app.app:create_app
+        DATABASE_USER: "{{ env_vars.DATABASE_USER }}"
+        DATABASE_PASSWORD: "{{ env_vars.DATABASE_PASSWORD }}"
+        DATABASE_DB: "{{ env_vars.DATABASE_DB }}"
+        DATABASE_HOST: "{{ env_vars.DATABASE_HOST | default('localhost') }}"
+      args:
+        chdir: "{{ project_dir }}"
+      become: yes
+      become_user: vagrant
+      tags: [app, run]
+
+    - name: Verificar que Flask se esté ejecutando
+      ansible.builtin.shell: "ps aux | grep -v grep | grep 'python3 -m flask run --host=0.0.0.0'"
+      register: flask_status
+      failed_when: flask_status.rc != 0 and 'python3 -m flask run' not in flask_status.stdout
+      tags: [app, run]
+
+    - name: Mostrar mensaje de acceso
+      ansible.builtin.debug:
+        msg: "✅ ¡Aprovisionamiento COMPLETO! La aplicación Flask está en segundo plano. Acceda en http://localhost:5001"
+      tags: [app, run]
